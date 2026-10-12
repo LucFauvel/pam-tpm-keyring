@@ -46,10 +46,18 @@ Tested on Arch Linux with SDDM 0.21, fprintd 1.94 and gnome-keyring 50.
   machine's TPM, and only while PCR 7 (the Secure Boot policy) matches.
 - **What it doesn't:** PCR 7 doesn't cover the kernel, initrd or kernel command
   line. Someone with physical access who can boot this machine into a root
-  shell with Secure Boot still on (editing the command line in the boot
-  loader, e.g. `init=/bin/sh`, or booting another signed kernel) can decrypt
-  it. Locking the boot loader's editor, or using a signed UKI, closes the
-  easy version of that. Full-disk encryption closes it properly.
+  shell with Secure Boot still on can decrypt it, for example by adding
+  `init=/bin/sh` to the kernel command line in the boot loader.
+  - Boot a signed unified kernel image (UKI) instead of a bare kernel. With
+    Secure Boot on, systemd-stub ignores the command line the boot loader
+    passes, and the initrd is covered by the signature. This works with any
+    boot loader.
+  - Don't leave anything else signed with the same key that can take a
+    command line: a signed bare kernel boots with any options and any initrd.
+  - It doesn't help if the root file system can be modified offline (taking
+    the disk out, or booting another OS with Secure Boot off): whatever runs
+    as root at the next normal boot can decrypt it. Full-disk encryption
+    closes that.
 - **The sealed copy is the login password itself,** so anyone with root on
   the running system can recover it.
 - **The TPM never sees the fingerprint.** Whether a fingerprint matched is
