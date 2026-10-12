@@ -1,0 +1,16 @@
+[package]
+name = "pam_tpm_keyring"
+version = "0.1.0"
+edition = "2024"
+description = "PAM module for fingerprint login that also unlocks the GNOME keyring, using a TPM-sealed copy of the password"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+lto = true
+strip = true
+
+[dependencies]
+dbus = "0.9"
