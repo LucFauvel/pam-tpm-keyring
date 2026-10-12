@@ -20,8 +20,10 @@
 //! - `max-tries=N`: non-matching scans allowed in `fingerprint` mode (default 3).
 //! - `debug`: log every step, not just failures.
 //!
-//! Failing to seal or unseal never blocks a login: the keyring just stays
-//! locked.
+//! `seal` and `unseal` always return PAM_IGNORE: they never authenticate
+//! anyone, so even a `sufficient` control can't turn them into a bypass. Only
+//! a fingerprint match in `fingerprint` mode returns PAM_SUCCESS. Failing to
+//! seal or unseal never blocks a login: the keyring just stays locked.
 
 mod fingerprint;
 mod input;
@@ -217,14 +219,14 @@ fn seal(pam: &Pam, user: &str) -> Result<c_int, String> {
     match tpm::unseal(user) {
         Ok(stored) if stored.0 == secret.0 => {
             pam.debug(&format!("sealed password for {user} is current"));
-            return Ok(PAM_SUCCESS);
+            return Ok(PAM_IGNORE);
         }
         Ok(_) => pam.debug(&format!("password for {user} changed, resealing")),
         Err(e) => pam.debug(&format!("no usable sealed password for {user} ({e}), sealing")),
     }
     tpm::seal(user, &secret)?;
     pam.log(LOG_INFO, &format!("sealed the keyring password for {user} to the TPM"));
-    Ok(PAM_SUCCESS)
+    Ok(PAM_IGNORE)
 }
 
 fn authenticate(pam: &Pam, args: &Args) -> Result<c_int, String> {
@@ -240,7 +242,7 @@ fn authenticate(pam: &Pam, args: &Args) -> Result<c_int, String> {
         Mode::Seal => seal(pam, &user),
         Mode::Unseal => {
             pam.unseal_into_authtok(&user);
-            Ok(PAM_SUCCESS)
+            Ok(PAM_IGNORE)
         }
     }
 }

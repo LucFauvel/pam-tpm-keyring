@@ -4,6 +4,8 @@
 //! the user presses a key or clicks (see `input`): SDDM's greeter has no way
 //! to cancel a login that is in progress.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -27,6 +29,9 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long to keep retrying while a previous login still holds the device.
 const CLAIM_RETRY: Duration = Duration::from_secs(10);
 const POLL: Duration = Duration::from_millis(100);
+/// Give up on a scan nobody touches, so a stuck fprintd can't hang the login.
+/// Reported as a cancellation, so the greeter just starts a new scan.
+const SCAN_TIMEOUT: Duration = Duration::from_secs(300);
 
 // Status messages sent to the greeter. The SDDM theme matches on these
 // exact strings, so change both together.
@@ -72,6 +77,21 @@ fn run(user: &str, max_tries: u32, info: &dyn Fn(&str)) -> Result<Outcome, Strin
         Err(e) => return Err(dbus_err("GetDefaultDevice")(e)),
     };
 
+    // If fprintd restarts, our claim is gone and its signals would come from a
+    // new unique name we don't trust: give up instead of waiting forever.
+    // Registered before GetNameOwner so no change can slip in between.
+    let owner_changed = Arc::new(AtomicBool::new(false));
+    let flag = owner_changed.clone();
+    let mut rule = MatchRule::new_signal("org.freedesktop.DBus", "NameOwnerChanged");
+    rule.sender = Some("org.freedesktop.DBus".into());
+    conn.add_match(rule, move |(): (), _: &Connection, msg: &Message| {
+        if msg.read1::<&str>().is_ok_and(|name| name == FPRINT) {
+            flag.store(true, Ordering::SeqCst);
+        }
+        true
+    })
+    .map_err(dbus_err("AddMatch"))?;
+
     // Signals are only trusted from fprintd itself; any client on the system
     // bus can emit a VerifyStatus signal with fprintd's object path.
     let bus = conn.with_proxy("org.freedesktop.DBus", "/org/freedesktop/DBus", CALL_TIMEOUT);
@@ -89,6 +109,18 @@ fn run(user: &str, max_tries: u32, info: &dyn Fn(&str)) -> Result<Outcome, Strin
         Err(e) => return Err(dbus_err("ListEnrolledFingers")(e)),
     }
 
+    let mut input = InputWatch::open();
+    info(MSG_STARTING);
+    if !claim(&device, user, &mut input)? {
+        return Ok(Outcome::Cancelled);
+    }
+    let _claim = Claim { conn: &conn, path: &path };
+
+    // fprintd broadcasts VerifyStatus, so other clients' verifications on this
+    // device (sudo, a TTY login) are visible too. Only listen once we hold the
+    // device: nobody else can verify on it from here on, and fprintd's
+    // messages arrive in order, so nothing from an earlier session can follow
+    // the Claim reply.
     let (tx, rx) = mpsc::channel();
     let mut rule = MatchRule::new_signal(DEVICE, "VerifyStatus");
     rule.path = Some(path.clone());
@@ -102,22 +134,19 @@ fn run(user: &str, max_tries: u32, info: &dyn Fn(&str)) -> Result<Outcome, Strin
     })
     .map_err(dbus_err("AddMatch"))?;
 
-    let mut input = InputWatch::open();
-    info(MSG_STARTING);
-    if !claim(&device, user, &mut input)? {
-        return Ok(Outcome::Cancelled);
-    }
-    let _claim = Claim { conn: &conn, path: &path };
-
     device
         .method_call::<(), _, _, _>(DEVICE, "VerifyStart", ("any",))
         .map_err(dbus_err("VerifyStart"))?;
     info(MSG_READY);
+    let deadline = Instant::now() + SCAN_TIMEOUT;
 
     let mut tries = 0;
     loop {
         conn.process(POLL).map_err(dbus_err("process"))?;
-        if input.pressed() {
+        if owner_changed.load(Ordering::SeqCst) {
+            return Err("fprintd restarted during the scan".into());
+        }
+        if input.pressed() || Instant::now() >= deadline {
             stop(&device);
             return Ok(Outcome::Cancelled);
         }

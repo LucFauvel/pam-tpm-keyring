@@ -39,9 +39,28 @@ locked. The next password login reseals automatically.
 
 Tested on Arch Linux with SDDM 0.21, fprintd 1.94 and gnome-keyring 50.
 
-The sealed copy is the login password itself. It is readable only by root
-and decryptable only by this machine's TPM in the same Secure Boot state, but
-anyone with root on the running system can recover it.
+## Security notes
+
+- **What the TPM binding protects against:** copying the sealed file (or the
+  whole disk) to another machine. The copy can only be decrypted by this
+  machine's TPM, and only while PCR 7 (the Secure Boot policy) matches.
+- **What it doesn't:** PCR 7 doesn't cover the kernel, initrd or kernel command
+  line. Someone with physical access who can boot this machine into a root
+  shell with Secure Boot still on (editing the command line in the boot
+  loader, e.g. `init=/bin/sh`, or booting another signed kernel) can decrypt
+  it. Locking the boot loader's editor, or using a signed UKI, closes the
+  easy version of that. Full-disk encryption closes it properly.
+- **The sealed copy is the login password itself,** so anyone with root on
+  the running system can recover it.
+- **The TPM never sees the fingerprint.** Whether a fingerprint matched is
+  decided by fprintd on the host; the TPM only checks the boot state.
+- **Fingerprint attempts don't count toward `pam_faillock`** (the same as
+  `pam_fprintd`). They are limited by `max-tries` per login and need a
+  physical touch each time.
+- `seal` and `unseal` always return `PAM_IGNORE`, so they can't authenticate
+  anyone even if configured as `sufficient`. With `unseal` in your own stack,
+  keep in mind that every module after it sees the unsealed password in
+  `PAM_AUTHTOK`.
 
 ## Install
 

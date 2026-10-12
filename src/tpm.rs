@@ -2,7 +2,7 @@
 
 use std::fs;
 use std::io::{Read, Write};
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{Ordering, compiler_fence};
@@ -94,6 +94,11 @@ fn systemd_creds(args: &[&str], input: Option<&Secret>) -> Result<Secret, String
         .map_err(|e| format!("cannot read from systemd-creds: {e}"))?;
     let mut err = String::new();
     let _ = child.stderr.take().expect("stderr is piped").read_to_string(&mut err);
+    if out.0.len() >= MAX_SECRET_LEN {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err("systemd-creds output is too long".into());
+    }
 
     match child.wait() {
         Ok(status) if status.success() => Ok(out),
@@ -105,18 +110,31 @@ fn systemd_creds(args: &[&str], input: Option<&Secret>) -> Result<Secret, String
     }
 }
 
-pub fn unseal(user: &str) -> Result<Secret, String> {
-    let path = cred_path(user);
-    if !path.exists() {
-        return Err(format!("{} does not exist", path.display()));
-    }
+fn decrypt(path: &Path, name: &str) -> Result<Secret, String> {
     let path = path.to_str().expect("path is ASCII");
-    let name = cred_name(user);
     let secret = systemd_creds(&["decrypt", &format!("--name={name}"), path, "-"], None)?;
     if secret.0.is_empty() {
         return Err("sealed password is empty".into());
     }
     Ok(secret)
+}
+
+/// The state directory must be a real directory, owned by root, private.
+fn check_state_dir() -> Result<(), String> {
+    let meta = fs::symlink_metadata(STATE_DIR).map_err(|e| format!("{STATE_DIR}: {e}"))?;
+    if !meta.file_type().is_dir() || meta.uid() != 0 || meta.mode() & 0o077 != 0 {
+        return Err(format!("{STATE_DIR} must be a root-owned directory with mode 0700"));
+    }
+    Ok(())
+}
+
+pub fn unseal(user: &str) -> Result<Secret, String> {
+    let path = cred_path(user);
+    if !path.exists() {
+        return Err(format!("{} does not exist", path.display()));
+    }
+    check_state_dir()?;
+    decrypt(&path, &cred_name(user))
 }
 
 pub fn seal(user: &str, secret: &Secret) -> Result<(), String> {
@@ -125,6 +143,7 @@ pub fn seal(user: &str, secret: &Secret) -> Result<(), String> {
         .recursive(true)
         .create(STATE_DIR)
         .map_err(|e| format!("cannot create {STATE_DIR}: {e}"))?;
+    check_state_dir()?;
 
     let path = cred_path(user);
     let tmp = Path::new(STATE_DIR).join(format!(".{user}.cred.tmp"));
@@ -142,17 +161,19 @@ pub fn seal(user: &str, secret: &Secret) -> Result<(), String> {
         Some(secret),
     )?;
 
-    let written = fs::metadata(&tmp).map(|m| m.len() > 0).unwrap_or(false);
-    if !written {
-        return Err("systemd-creds produced no output".into());
-    }
-    let result = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))
-        .and_then(|_| fs::rename(&tmp, &path));
-    if let Err(e) = result {
+    // Only replace the stored copy with one that is known to decrypt to the
+    // right password (the exit status of systemd-creds may have been lost).
+    let result = match decrypt(&tmp, &name) {
+        Ok(check) if check.0 == secret.0 => fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))
+            .and_then(|_| fs::rename(&tmp, &path))
+            .map_err(|e| format!("cannot store {}: {e}", path.display())),
+        Ok(_) => Err("new sealed copy doesn't match, keeping the old one".into()),
+        Err(e) => Err(format!("new sealed copy doesn't decrypt ({e}), keeping the old one")),
+    };
+    if result.is_err() {
         let _ = fs::remove_file(&tmp);
-        return Err(format!("cannot store {}: {e}", path.display()));
     }
-    Ok(())
+    result
 }
 
 #[cfg(test)]
