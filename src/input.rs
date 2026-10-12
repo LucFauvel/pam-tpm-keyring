@@ -8,6 +8,11 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read};
 use std::os::unix::fs::OpenOptionsExt;
 
+// The constants below are the x86_64/aarch64 Linux values. Elsewhere a wrong
+// O_NONBLOCK would make the read block and hang the login.
+#[cfg(not(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))))]
+compile_error!("input.rs assumes x86_64 or aarch64 Linux");
+
 const O_NONBLOCK: i32 = 0o4000;
 const EV_KEY: u16 = 1;
 const KEY_PRESS: i32 = 1;

@@ -123,10 +123,13 @@ impl Pam {
         if resp.is_null() {
             return Ok(Secret::with_capacity(0));
         }
-        let bytes = unsafe { CStr::from_ptr(resp) }.to_bytes();
-        let secret = Secret::from_bytes(bytes);
+        let (secret, len) = {
+            let bytes = unsafe { CStr::from_ptr(resp) }.to_bytes();
+            (Secret::from_bytes(bytes), bytes.len())
+        };
+        // `bytes` is gone before the buffer is written through `resp`.
         unsafe {
-            std::ptr::write_bytes(resp, 0, bytes.len());
+            std::ptr::write_bytes(resp, 0, len);
             free(resp as *mut c_void);
         }
         Ok(secret)
