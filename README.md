@@ -20,15 +20,19 @@ Modes:
   unless the stored copy is already current. Skipped unless Secure Boot is
   enforced.
 - `unseal`: for stacks that keep using `pam_fprintd`.
+- `allow-locked`: see below.
 - `max-tries=N` (default 3), `debug`.
 
 Sealed copies live in `/var/lib/pam-tpm-keyring/<user>.cred` (root only). They
 can only be decrypted by this machine's TPM, and only while PCR 7 matches.
 fprintd signals are only accepted from fprintd's own bus name.
 
-If unsealing fails (for example, after a firmware or Secure Boot database
-update changed PCR 7), the fingerprint login still works but the keyring stays
-locked. The next password login reseals automatically.
+`fingerprint` unseals the password before it starts a scan. If that fails
+(nothing sealed yet, or a firmware or Secure Boot database update changed
+PCR 7), it doesn't scan: it sends "Enter your password to unlock the keyring"
+and fails, so the greeter asks for the password, and that login reseals it.
+With `allow-locked` it scans anyway; the login works, but the keyring stays
+locked until the next password login.
 
 ## Requirements
 
@@ -108,8 +112,9 @@ SDDM's greeter can't cancel a login in progress, so a theme that wants
   `sddm.login` with the typed password (SDDM ignores logins while one is
   running).
 - Any other `loginFailed` after a scan (no match, no enrolled prints, no
-  reader) means fingerprint login isn't possible right now; fall back to the
-  password field.
+  reader, or "Enter your password to unlock the keyring") means fingerprint
+  login isn't possible right now; fall back to the password field and show the
+  last message.
 - Never submit an empty password from the password field: that starts a scan.
 
 ## Enable for SDDM

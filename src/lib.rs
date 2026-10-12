@@ -17,6 +17,11 @@
 //!   password is never sealed to an unprotected boot state.
 //! - `unseal`: for stacks that use pam_fprintd. Set the unsealed password as
 //!   PAM_AUTHTOK.
+//!   Before scanning, the sealed password is unsealed. If that fails (nothing
+//!   sealed yet, or PCR 7 changed), no scan is started: the greeter is told to
+//!   ask for the password, whose login reseals it.
+//! - `allow-locked`: in `fingerprint` mode, scan anyway when unsealing fails.
+//!   The login then works but the keyring stays locked.
 //! - `max-tries=N`: non-matching scans allowed in `fingerprint` mode (default 3).
 //! - `debug`: log every step, not just failures.
 //!
@@ -70,6 +75,7 @@ enum Mode {
 
 struct Args {
     mode: Option<Mode>,
+    allow_locked: bool,
     max_tries: u32,
     debug: bool,
 }
@@ -182,7 +188,7 @@ impl Pam {
     }
 }
 
-fn fingerprint(pam: &Pam, user: &str, max_tries: u32) -> Result<c_int, String> {
+fn fingerprint(pam: &Pam, user: &str, args: &Args) -> Result<c_int, String> {
     let typed = pam.prompt_password()?;
     if !typed.0.is_empty() {
         pam.set_authtok(&typed)?;
@@ -190,11 +196,31 @@ fn fingerprint(pam: &Pam, user: &str, max_tries: u32) -> Result<c_int, String> {
         return Ok(PAM_IGNORE);
     }
 
-    let outcome = fingerprint::verify(user, max_tries, &|msg| pam.info(msg), &|e| pam.log(LOG_ERR, e));
+    // Unseal first, so a keyring that can't be unlocked is reported before the
+    // user touches the sensor, not after.
+    let sealed = match tpm::unseal(user) {
+        Ok(secret) => Some(secret),
+        Err(e) if args.allow_locked => {
+            pam.log(LOG_ERR, &format!("keyring will stay locked: {e}"));
+            None
+        }
+        Err(e) => {
+            pam.log(LOG_ERR, &format!("cannot unseal the keyring password, asking for the password: {e}"));
+            pam.info(fingerprint::MSG_NEEDS_PASSWORD);
+            return Ok(PAM_AUTH_ERR);
+        }
+    };
+
+    let outcome = fingerprint::verify(user, args.max_tries, &|msg| pam.info(msg), &|e| pam.log(LOG_ERR, e));
     match outcome {
         Outcome::Match => {
             pam.debug(&format!("fingerprint matched for {user}"));
-            pam.unseal_into_authtok(user);
+            if let Some(secret) = sealed {
+                match pam.set_authtok(&secret) {
+                    Ok(()) => pam.debug(&format!("unsealed the keyring password for {user}")),
+                    Err(e) => pam.log(LOG_ERR, &format!("keyring stays locked: {e}")),
+                }
+            }
             Ok(PAM_SUCCESS)
         }
         Outcome::Cancelled => {
@@ -241,7 +267,7 @@ fn authenticate(pam: &Pam, args: &Args) -> Result<c_int, String> {
         return Err(format!("refusing unusual user name {user:?}"));
     }
     match mode {
-        Mode::Fingerprint => fingerprint(pam, &user, args.max_tries),
+        Mode::Fingerprint => fingerprint(pam, &user, args),
         Mode::Seal => seal(pam, &user),
         Mode::Unseal => {
             pam.unseal_into_authtok(&user);
@@ -251,7 +277,7 @@ fn authenticate(pam: &Pam, args: &Args) -> Result<c_int, String> {
 }
 
 fn parse_args(argc: c_int, argv: *const *const c_char) -> Result<Args, String> {
-    let mut args = Args { mode: None, max_tries: DEFAULT_MAX_TRIES, debug: false };
+    let mut args = Args { mode: None, allow_locked: false, max_tries: DEFAULT_MAX_TRIES, debug: false };
     for i in 0..argc.max(0) as usize {
         let arg = unsafe { CStr::from_ptr(*argv.add(i)) };
         let arg = arg.to_str().map_err(|_| "argument is not valid UTF-8".to_string())?;
@@ -259,6 +285,7 @@ fn parse_args(argc: c_int, argv: *const *const c_char) -> Result<Args, String> {
             "fingerprint" => args.mode = Some(Mode::Fingerprint),
             "seal" => args.mode = Some(Mode::Seal),
             "unseal" => args.mode = Some(Mode::Unseal),
+            "allow-locked" => args.allow_locked = true,
             "debug" => args.debug = true,
             _ => match arg.strip_prefix("max-tries=").map(str::parse) {
                 Some(Ok(n)) if n > 0 => args.max_tries = n,
