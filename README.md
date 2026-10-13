@@ -30,8 +30,10 @@ Modes:
   (only while Secure Boot is enforced), and replaces `PAM_AUTHTOK` with the
   key.
 - `unseal`: for stacks that keep using `pam_fprintd`.
-- `allow-locked`: see below.
-- `max-tries=N` (default 3), `debug`.
+- `allow-locked`: in `fingerprint` mode, scan even when the key can't be
+  unsealed (see below).
+- `max-tries=N`: non-matching scans allowed per login (default 3).
+- `debug`: log every step, not just failures.
 - No mode, in the `password` stack: rewraps the key when the login password
   changes.
 
@@ -83,8 +85,14 @@ Tested on Arch Linux with SDDM 0.21, fprintd 1.94 and gnome-keyring 50.
     the disk out, or booting another OS with Secure Boot off): whatever runs
     as root at the next normal boot can decrypt it. Full-disk encryption
     closes that.
+  - The module and the command hold the key and the password in memory
+    briefly, without locking it, so either can end up in swap. Encrypt swap
+    along with the disk.
 - **Root on the running system can recover the key** (and read an unlocked
   keyring from memory anyway).
+- **The polkit unlock releases the TPM copy after your own password,** in an
+  active local session only. A program running as you can open that dialog,
+  as it could the keyring's own prompt; both need the password typed.
 - **The TPM never sees the fingerprint.** Whether a fingerprint matched is
   decided by fprintd on the host; the TPM only checks the boot state.
 - **Fingerprint attempts don't count toward `pam_faillock`** (the same as
@@ -100,10 +108,26 @@ Tested on Arch Linux with SDDM 0.21, fprintd 1.94 and gnome-keyring 50.
 cargo build --release
 sudo install -Dm755 target/release/libpam_tpm_keyring.so /usr/lib/security/pam_tpm_keyring.so
 sudo install -Dm755 target/release/pam-tpm-keyring /usr/local/bin/pam-tpm-keyring
+```
+
+## Enable for SDDM
+
+```sh
+sudo cp /etc/pam.d/sddm /etc/pam.d/sddm.orig
+sudo install -m644 pam.d/sddm /etc/pam.d/sddm
 sudo install -m644 pam.d/passwd /etc/pam.d/passwd   # Arch's, plus the rewrap line
 ```
 
-Then, logged in (the keyring daemon has to be running):
+Keep a TTY login (Ctrl+Alt+F3) handy the first time; it uses a different PAM
+stack. To revert, `sudo mv /etc/pam.d/sddm.orig /etc/pam.d/sddm`.
+
+`pam.d/sddm` spells out `system-login`'s auth section, so later changes to
+`system-auth` don't reach SDDM's auth stack. Your SDDM theme also has to
+drive the fingerprint scan, see [Greeter integration](#greeter-integration).
+
+## Set up the keyring
+
+Logged in (the keyring daemon has to be running):
 
 ```sh
 sudo pam-tpm-keyring setup
@@ -111,13 +135,21 @@ sudo pam-tpm-keyring setup
 
 It asks for your login password, generates the key, writes both copies, and
 changes the login keyring's password to the key through gnome-keyring's
-control socket (the one `pam_gnome_keyring` uses). Running it again generates
-a new key.
+control socket (the one `pam_gnome_keyring` uses). Both copies are written
+and checked before the keyring changes, so a failure leaves the old password
+working. Running it again generates a new key.
 
-**After setup, the keyring's own unlock prompt wants the key,** which nobody
-knows. Logins through SDDM unlock it, and it stays unlocked for the session.
-If it ends up locked anyway (a session started some other way, a daemon
-restart), unlock it with `sudo pam-tpm-keyring unlock`, or graphically:
+Then delete any backup of `login.keyring` from before setup (see the security
+notes).
+
+## Day to day
+
+**Logins through SDDM unlock the keyring**, by fingerprint or password, and it
+stays unlocked for the session.
+
+**If it ends up locked anyway** (a session started some other way, a daemon
+restart), don't use the keyring's own prompt: it wants the key, which nobody
+knows. Use `sudo pam-tpm-keyring unlock`, or the graphical unlock:
 
 ```sh
 sudo install -m644 polkit/io.github.lucfauvel.pam-tpm-keyring.policy /usr/share/polkit-1/actions/
@@ -125,13 +157,20 @@ sudo install -m755 contrib/unlock-keyring /usr/local/bin/unlock-keyring
 install -Dm644 contrib/unlock-keyring.desktop ~/.local/share/applications/unlock-keyring.desktop
 ```
 
-`unlock-keyring` (or "Unlock Keyring" in an app launcher; bind it to a key if
-you like) runs `pkexec pam-tpm-keyring unlock`. Your polkit agent asks for
-your own password, then the keyring is unlocked with the TPM copy of the key,
-the same way a fingerprint login does it. The policy covers only that
-command, asks every time, and only works in an active local session. If the
-TPM copy can't be unsealed, use the `sudo` form, which works from the
-password slot.
+`unlock-keyring` ("Unlock Keyring" in an app launcher) runs
+`pkexec pam-tpm-keyring unlock` and reports the result as a notification. Your
+polkit agent asks for your own password, then the keyring is unlocked with the
+TPM copy of the key, the same way a fingerprint login does it. The policy
+covers only that command, asks every time, and only works in an active local
+session. It needs a running polkit agent; on Hyprland, for example:
+
+```lua
+hl.exec_cmd("systemctl --user start hyprpolkitagent")   -- at startup
+hl.bind("SUPER + SHIFT + K", hl.dsp.exec_cmd("/usr/local/bin/unlock-keyring"))
+```
+
+If the TPM copy can't be unsealed (PCR 7 changed), use the `sudo` form, which
+works from the password slot, or log in with your password.
 
 **Password changes:** `pam.d/passwd` and `pam.d/sddm` rewrap the key with the
 new password. A change through any other PAM service is caught at the next
@@ -147,6 +186,7 @@ sudo pamtester pam-tpm-keyring-test "$USER" authenticate   # type the password: 
 sudo pamtester pam-tpm-keyring-test "$USER" authenticate   # press Enter, touch the sensor: unseals
 sudo pamtester pam-tpm-keyring-test "$USER" authenticate   # press Enter, then any key: cancels
 journalctl -b -t pamtester
+sudo rm /etc/pam.d/pam-tpm-keyring-test                     # when done: a fingerprint alone passes it
 ```
 
 The debug lines in the journal say where the keyring key came from. The test
@@ -173,18 +213,6 @@ SDDM's greeter can't cancel a login in progress, so a theme that wants
 - Any other `loginFailed` after a scan (no match, no enrolled prints, no
   reader, or "Enter your password to unlock the keyring") means fingerprint
   login isn't possible right now; fall back to the password field and show the
-  last message.
+  last message. Keep "Enter your password to unlock the keyring" on screen
+  until the password is submitted.
 - Never submit an empty password from the password field: that starts a scan.
-
-## Enable for SDDM
-
-```sh
-sudo cp /etc/pam.d/sddm /etc/pam.d/sddm.orig
-sudo install -m644 pam.d/sddm /etc/pam.d/sddm
-```
-
-Keep a TTY login (Ctrl+Alt+F3) handy the first time; it uses a different PAM
-stack. To revert, `sudo mv /etc/pam.d/sddm.orig /etc/pam.d/sddm`.
-
-`pam.d/sddm` spells out `system-login`'s auth section, so later changes to
-`system-auth` don't reach SDDM's auth stack.
