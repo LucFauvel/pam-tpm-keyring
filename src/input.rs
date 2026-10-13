@@ -8,16 +8,10 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read};
 use std::os::unix::fs::OpenOptionsExt;
 
-// The constants below are the x86_64/aarch64 Linux values. Elsewhere a wrong
-// O_NONBLOCK would make the read block and hang the login.
-#[cfg(not(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))))]
-compile_error!("input.rs assumes x86_64 or aarch64 Linux");
-
-const O_NONBLOCK: i32 = 0o4000;
 const EV_KEY: u16 = 1;
 const KEY_PRESS: i32 = 1;
-/// `struct input_event` on 64-bit Linux: timeval (16), type (2), code (2), value (4).
-const EVENT_SIZE: usize = 24;
+/// `struct input_event`: a timeval, then type (u16), code (u16), value (i32).
+const EVENT_SIZE: usize = std::mem::size_of::<libc::input_event>();
 
 pub struct InputWatch {
     devices: Vec<File>,
@@ -34,7 +28,7 @@ impl InputWatch {
             .filter_map(|entry| {
                 OpenOptions::new()
                     .read(true)
-                    .custom_flags(O_NONBLOCK)
+                    .custom_flags(libc::O_NONBLOCK)
                     .open(entry.path())
                     .ok()
             })
@@ -62,7 +56,9 @@ impl InputWatch {
 }
 
 fn is_press(event: &[u8]) -> bool {
-    let kind = u16::from_ne_bytes([event[16], event[17]]);
-    let value = i32::from_ne_bytes([event[20], event[21], event[22], event[23]]);
+    // Counted from the end, so the size of the timeval doesn't matter.
+    let n = EVENT_SIZE;
+    let kind = u16::from_ne_bytes([event[n - 8], event[n - 7]]);
+    let value = i32::from_ne_bytes([event[n - 4], event[n - 3], event[n - 2], event[n - 1]]);
     kind == EV_KEY && value == KEY_PRESS
 }

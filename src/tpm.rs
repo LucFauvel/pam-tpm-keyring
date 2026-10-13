@@ -1,13 +1,14 @@
-//! TPM-sealed copies of the login password, stored by systemd-creds.
+//! TPM-sealed copies of the keyring key, stored by systemd-creds.
 
 use std::fs;
 use std::io::{Read, Write};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{Ordering, compiler_fence};
 
-const STATE_DIR: &str = "/var/lib/pam-tpm-keyring";
+use crate::state::{self, Pending};
+
 const SYSTEMD_CREDS: &str = "/usr/bin/systemd-creds";
 const EFI_GLOBAL_GUID: &str = "8be4df61-93ca-11d2-aa0d-00e098032b8c";
 const MAX_SECRET_LEN: usize = 4096;
@@ -48,8 +49,12 @@ pub fn valid_user(user: &str) -> bool {
         && user.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
 }
 
+fn cred_file(user: &str) -> String {
+    format!("{user}.cred")
+}
+
 fn cred_path(user: &str) -> PathBuf {
-    Path::new(STATE_DIR).join(format!("{user}.cred"))
+    state::path(&cred_file(user))
 }
 
 fn cred_name(user: &str) -> String {
@@ -114,18 +119,9 @@ fn decrypt(path: &Path, name: &str) -> Result<Secret, String> {
     let path = path.to_str().expect("path is ASCII");
     let secret = systemd_creds(&["decrypt", &format!("--name={name}"), path, "-"], None)?;
     if secret.0.is_empty() {
-        return Err("sealed password is empty".into());
+        return Err("sealed key is empty".into());
     }
     Ok(secret)
-}
-
-/// The state directory must be a real directory, owned by root, private.
-fn check_state_dir() -> Result<(), String> {
-    let meta = fs::symlink_metadata(STATE_DIR).map_err(|e| format!("{STATE_DIR}: {e}"))?;
-    if !meta.file_type().is_dir() || meta.uid() != 0 || meta.mode() & 0o077 != 0 {
-        return Err(format!("{STATE_DIR} must be a root-owned directory with mode 0700"));
-    }
-    Ok(())
 }
 
 pub fn unseal(user: &str) -> Result<Secret, String> {
@@ -133,21 +129,15 @@ pub fn unseal(user: &str) -> Result<Secret, String> {
     if !path.exists() {
         return Err(format!("{} does not exist", path.display()));
     }
-    check_state_dir()?;
+    state::check_dir()?;
     decrypt(&path, &cred_name(user))
 }
 
-pub fn seal(user: &str, secret: &Secret) -> Result<(), String> {
-    fs::DirBuilder::new()
-        .mode(0o700)
-        .recursive(true)
-        .create(STATE_DIR)
-        .map_err(|e| format!("cannot create {STATE_DIR}: {e}"))?;
-    check_state_dir()?;
-
-    let path = cred_path(user);
-    let tmp = Path::new(STATE_DIR).join(format!(".{user}.cred.tmp"));
-    let _ = fs::remove_file(&tmp);
+/// Seals `secret` for `user`, without replacing the stored copy until the
+/// result is committed.
+pub fn seal_pending(user: &str, secret: &Secret) -> Result<Pending, String> {
+    let pending = Pending::new(&cred_file(user))?;
+    let tmp = pending.tmp_path();
     let name = cred_name(user);
     systemd_creds(
         &[
@@ -161,19 +151,20 @@ pub fn seal(user: &str, secret: &Secret) -> Result<(), String> {
         Some(secret),
     )?;
 
-    // Only replace the stored copy with one that is known to decrypt to the
-    // right password (the exit status of systemd-creds may have been lost).
-    let result = match decrypt(&tmp, &name) {
-        Ok(check) if check.0 == secret.0 => fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))
-            .and_then(|_| fs::rename(&tmp, &path))
-            .map_err(|e| format!("cannot store {}: {e}", path.display())),
-        Ok(_) => Err("new sealed copy doesn't match, keeping the old one".into()),
-        Err(e) => Err(format!("new sealed copy doesn't decrypt ({e}), keeping the old one")),
-    };
-    if result.is_err() {
-        let _ = fs::remove_file(&tmp);
+    // Only accept a sealed copy that is known to decrypt to the right secret
+    // (the exit status of systemd-creds may have been lost).
+    match decrypt(tmp, &name) {
+        Ok(check) if check.0 == secret.0 => {}
+        Ok(_) => return Err("new sealed copy doesn't match, keeping the old one".into()),
+        Err(e) => return Err(format!("new sealed copy doesn't decrypt ({e}), keeping the old one")),
     }
-    result
+    fs::set_permissions(tmp, fs::Permissions::from_mode(0o600))
+        .map_err(|e| format!("cannot chmod {}: {e}", tmp.display()))?;
+    Ok(pending)
+}
+
+pub fn seal(user: &str, secret: &Secret) -> Result<(), String> {
+    seal_pending(user, secret)?.commit()
 }
 
 #[cfg(test)]

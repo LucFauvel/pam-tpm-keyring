@@ -43,7 +43,7 @@ pub const MSG_FAILED: &str = "Fingerprint not recognized";
 pub const MSG_CANCELLED: &str = "Fingerprint cancelled";
 pub const MSG_NO_PRINTS: &str = "No fingerprints enrolled";
 pub const MSG_UNAVAILABLE: &str = "Fingerprint reader unavailable";
-/// The sealed password can't be unsealed (none yet, or PCR 7 changed).
+/// The keyring key can't be unsealed (PCR 7 changed).
 pub const MSG_NEEDS_PASSWORD: &str = "Enter your password to unlock the keyring";
 
 pub enum Outcome {

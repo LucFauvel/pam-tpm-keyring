@@ -1,51 +1,66 @@
 //! pam_tpm_keyring: fingerprint login that also unlocks the GNOME keyring.
 //!
 //! A fingerprint login never produces a password, so pam_gnome_keyring has
-//! nothing to unlock the login keyring with. This module keeps a copy of the
-//! login password sealed to the TPM (PCR 7, the Secure Boot state) and hands it
-//! to pam_gnome_keyring after a fingerprint match.
+//! nothing to unlock the login keyring with. After `pam-tpm-keyring setup`, the
+//! login keyring's password is a random key instead of the login password.
+//! The key is kept twice (see `slot`): sealed to the TPM (PCR 7, the Secure
+//! Boot state) for fingerprint logins, and wrapped with the login password for
+//! password logins. Either way this module hands the key to pam_gnome_keyring
+//! as PAM_AUTHTOK, so the login password itself is never stored.
 //!
-//! Module arguments (one mode is required):
+//! Module arguments (one mode is required in the auth stack):
 //! - `fingerprint`: ask for the password. If one was typed, set it as
 //!   PAM_AUTHTOK and return PAM_IGNORE so the password modules that follow
 //!   check it. If it was empty, verify a fingerprint through fprintd instead:
-//!   on a match, set the unsealed password as PAM_AUTHTOK and return
-//!   PAM_SUCCESS. Otherwise return PAM_AUTH_ERR. Pressing any key or mouse
-//!   button cancels the scan.
-//! - `seal`: password path. Seal PAM_AUTHTOK (just verified by pam_unix) unless
-//!   the stored copy is already current. Skipped when Secure Boot is off, so the
-//!   password is never sealed to an unprotected boot state.
-//! - `unseal`: for stacks that use pam_fprintd. Set the unsealed password as
+//!   on a match, set the keyring key as PAM_AUTHTOK and return PAM_SUCCESS.
+//!   Otherwise return PAM_AUTH_ERR. Pressing any key or mouse button cancels
+//!   the scan. The key is unsealed before scanning; if that fails (PCR 7
+//!   changed), no scan is started and the greeter is told to ask for the
+//!   password instead, whose login reseals the key.
+//! - `seal`: password path, after pam_unix accepted PAM_AUTHTOK. Open the slot
+//!   with it, reseal the key to the TPM if needed (only while Secure Boot is
+//!   enforced), and replace PAM_AUTHTOK with the key. If the slot doesn't open
+//!   (the password was changed without this module), take the key from the TPM
+//!   and rewrap it with the new password.
+//! - `unseal`: for stacks that use pam_fprintd. Set the keyring key as
 //!   PAM_AUTHTOK.
-//!   Before scanning, the sealed password is unsealed. If that fails (nothing
-//!   sealed yet, or PCR 7 changed), no scan is started: the greeter is told to
-//!   ask for the password, whose login reseals it.
 //! - `allow-locked`: in `fingerprint` mode, scan anyway when unsealing fails.
 //!   The login then works but the keyring stays locked.
 //! - `max-tries=N`: non-matching scans allowed in `fingerprint` mode (default 3).
 //! - `debug`: log every step, not just failures.
 //!
+//! In the password stack (no mode), a password change rewraps the key with
+//! the new password.
+//!
 //! `seal` and `unseal` always return PAM_IGNORE: they never authenticate
 //! anyone, so even a `sufficient` control can't turn them into a bypass. Only
 //! a fingerprint match in `fingerprint` mode returns PAM_SUCCESS. Failing to
-//! seal or unseal never blocks a login: the keyring just stays locked.
+//! unlock the keyring never blocks a login: the keyring just stays locked.
+//! Users who haven't run setup get plain fingerprint login.
 
+pub mod account;
+pub mod control;
 mod fingerprint;
 mod input;
-mod tpm;
+pub mod slot;
+pub mod state;
+pub mod tpm;
 
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use fingerprint::Outcome;
+use slot::OpenError;
 use tpm::Secret;
 
 const PAM_SUCCESS: c_int = 0;
 const PAM_AUTH_ERR: c_int = 7;
 const PAM_IGNORE: c_int = 25;
 const PAM_AUTHTOK: c_int = 6;
+const PAM_OLDAUTHTOK: c_int = 7;
 const PAM_PROMPT_ECHO_OFF: c_int = 1;
 const PAM_TEXT_INFO: c_int = 4;
+const PAM_UPDATE_AUTHTOK: c_int = 0x2000;
 
 const LOG_ERR: c_int = 3;
 const LOG_INFO: c_int = 6;
@@ -153,14 +168,15 @@ impl Pam {
             .map_err(|_| "user name is not valid UTF-8".into())
     }
 
-    fn authtok(&self) -> Option<Secret> {
+    /// PAM_AUTHTOK or PAM_OLDAUTHTOK, if set and not empty.
+    fn token(&self, item_type: c_int) -> Option<Secret> {
         let mut item: *const c_void = std::ptr::null();
-        let ret = unsafe { pam_get_item(self.handle, PAM_AUTHTOK, &mut item) };
+        let ret = unsafe { pam_get_item(self.handle, item_type, &mut item) };
         if ret != PAM_SUCCESS || item.is_null() {
             return None;
         }
         let bytes = unsafe { CStr::from_ptr(item as *const c_char) }.to_bytes();
-        Some(Secret::from_bytes(bytes))
+        Some(Secret::from_bytes(bytes)).filter(|s| !s.0.is_empty())
     }
 
     fn set_authtok(&self, secret: &Secret) -> Result<(), String> {
@@ -178,11 +194,11 @@ impl Pam {
         Ok(())
     }
 
-    /// Sets the TPM-sealed password as PAM_AUTHTOK. Failure only means the
+    /// Sets the TPM-sealed keyring key as PAM_AUTHTOK. Failure only means the
     /// keyring stays locked, so it is logged, not returned.
     fn unseal_into_authtok(&self, user: &str) {
-        match tpm::unseal(user).and_then(|secret| self.set_authtok(&secret)) {
-            Ok(()) => self.debug(&format!("unsealed the keyring password for {user}")),
+        match tpm::unseal(user).and_then(|key| self.set_authtok(&key)) {
+            Ok(()) => self.debug(&format!("unsealed the keyring key for {user}")),
             Err(e) => self.log(LOG_ERR, &format!("keyring stays locked: {e}")),
         }
     }
@@ -198,26 +214,32 @@ fn fingerprint(pam: &Pam, user: &str, args: &Args) -> Result<c_int, String> {
 
     // Unseal first, so a keyring that can't be unlocked is reported before the
     // user touches the sensor, not after.
-    let sealed = match tpm::unseal(user) {
-        Ok(secret) => Some(secret),
-        Err(e) if args.allow_locked => {
-            pam.log(LOG_ERR, &format!("keyring will stay locked: {e}"));
-            None
-        }
-        Err(e) => {
-            pam.log(LOG_ERR, &format!("cannot unseal the keyring password, asking for the password: {e}"));
-            pam.info(fingerprint::MSG_NEEDS_PASSWORD);
-            return Ok(PAM_AUTH_ERR);
+    let key = if !slot::exists(user) {
+        pam.log(LOG_INFO, &format!("keyring unlock isn't set up for {user} (pam-tpm-keyring setup)"));
+        None
+    } else {
+        match tpm::unseal(user) {
+            Ok(key) => Some(key),
+            Err(e) if args.allow_locked => {
+                pam.log(LOG_ERR, &format!("keyring will stay locked: {e}"));
+                None
+            }
+            Err(e) => {
+                pam.log(LOG_ERR, &format!("cannot unseal the keyring key, asking for the password: {e}"));
+                pam.info(fingerprint::MSG_NEEDS_PASSWORD);
+                return Ok(PAM_AUTH_ERR);
+            }
         }
     };
+
 
     let outcome = fingerprint::verify(user, args.max_tries, &|msg| pam.info(msg), &|e| pam.log(LOG_ERR, e));
     match outcome {
         Outcome::Match => {
             pam.debug(&format!("fingerprint matched for {user}"));
-            if let Some(secret) = sealed {
-                match pam.set_authtok(&secret) {
-                    Ok(()) => pam.debug(&format!("unsealed the keyring password for {user}")),
+            if let Some(key) = key {
+                match pam.set_authtok(&key) {
+                    Ok(()) => pam.debug(&format!("unlocking the keyring with the unsealed key for {user}")),
                     Err(e) => pam.log(LOG_ERR, &format!("keyring stays locked: {e}")),
                 }
             }
@@ -237,24 +259,75 @@ fn fingerprint(pam: &Pam, user: &str, args: &Args) -> Result<c_int, String> {
 }
 
 fn seal(pam: &Pam, user: &str) -> Result<c_int, String> {
-    if !tpm::secure_boot_enforced() {
-        pam.debug("Secure Boot is not enforced, not sealing");
-        return Ok(PAM_IGNORE);
-    }
-    let Some(secret) = pam.authtok().filter(|s| !s.0.is_empty()) else {
-        pam.debug("no password to seal");
+    let Some(password) = pam.token(PAM_AUTHTOK) else {
+        pam.debug("no password");
         return Ok(PAM_IGNORE);
     };
-    match tpm::unseal(user) {
-        Ok(stored) if stored.0 == secret.0 => {
-            pam.debug(&format!("sealed password for {user} is current"));
+    let key = match slot::open(user, &password) {
+        Ok(key) => key,
+        Err(OpenError::Missing) => {
+            pam.debug(&format!("keyring unlock isn't set up for {user}"));
             return Ok(PAM_IGNORE);
         }
-        Ok(_) => pam.debug(&format!("password for {user} changed, resealing")),
-        Err(e) => pam.debug(&format!("no usable sealed password for {user} ({e}), sealing")),
+        Err(e) => {
+            // The password was changed without this module (or the slot is
+            // damaged); the TPM still has the key. Rewrapping replaces the
+            // slot, so don't take the stack's word that the password is right.
+            if !account::check_password(user, &password)? {
+                return Err(format!("{}, and it isn't the login password: not rewrapping", e.describe()));
+            }
+            let key = tpm::unseal(user).map_err(|t| {
+                format!("keyring stays locked: {}, and the TPM copy can't be unsealed ({t})", e.describe())
+            })?;
+            match slot::store(user, &password, &key) {
+                Ok(()) => pam.log(LOG_INFO, &format!("rewrapped the keyring key for {user} with the current password")),
+                Err(e) => pam.log(LOG_ERR, &format!("cannot rewrap the keyring key: {e}")),
+            }
+            key
+        }
+    };
+
+    if !tpm::secure_boot_enforced() {
+        pam.debug("Secure Boot is not enforced, not sealing");
+    } else {
+        match tpm::unseal(user) {
+            Ok(stored) if stored.0 == key.0 => pam.debug(&format!("sealed key for {user} is current")),
+            _ => match tpm::seal(user, &key) {
+                Ok(()) => pam.log(LOG_INFO, &format!("sealed the keyring key for {user} to the TPM")),
+                Err(e) => pam.log(LOG_ERR, &format!("cannot seal the keyring key: {e}")),
+            },
+        }
     }
-    tpm::seal(user, &secret)?;
-    pam.log(LOG_INFO, &format!("sealed the keyring password for {user} to the TPM"));
+
+    pam.set_authtok(&key)?;
+    pam.debug("unlocking the keyring with the key from the password slot");
+    Ok(PAM_IGNORE)
+}
+
+/// Password stack: follow a password change by rewrapping the keyring key
+/// with the new password.
+fn change_password(pam: &Pam, user: &str) -> Result<c_int, String> {
+    if !slot::exists(user) {
+        return Ok(PAM_IGNORE);
+    }
+    let Some(new) = pam.token(PAM_AUTHTOK) else {
+        pam.debug("no new password");
+        return Ok(PAM_IGNORE);
+    };
+    // Only follow a change that actually happened.
+    if !account::check_password(user, &new)? {
+        pam.log(LOG_ERR, "the password wasn't changed, keeping the password slot");
+        return Ok(PAM_IGNORE);
+    }
+    // Root changing someone else's password doesn't know the old one.
+    let key = match pam.token(PAM_OLDAUTHTOK).map(|old| slot::open(user, &old)) {
+        Some(Ok(key)) => key,
+        _ => tpm::unseal(user).map_err(|e| {
+            format!("cannot rewrap the keyring key, it is still wrapped with the old password: the TPM copy can't be unsealed ({e})")
+        })?,
+    };
+    slot::store(user, &new, &key)?;
+    pam.log(LOG_INFO, &format!("rewrapped the keyring key for {user} with the new password"));
     Ok(PAM_IGNORE)
 }
 
@@ -313,6 +386,40 @@ pub extern "C" fn pam_sm_authenticate(
         };
         let pam = Pam { handle: pamh, debug: args.debug };
         authenticate(&pam, &args).unwrap_or_else(|e| {
+            pam.log(LOG_ERR, &e);
+            PAM_IGNORE
+        })
+    }));
+    result.unwrap_or(PAM_IGNORE)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn pam_sm_chauthtok(
+    pamh: *mut PamHandle,
+    flags: c_int,
+    argc: c_int,
+    argv: *const *const c_char,
+) -> c_int {
+    // Called twice: a preliminary check, then the update.
+    if flags & PAM_UPDATE_AUTHTOK == 0 {
+        return PAM_IGNORE;
+    }
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let args = match parse_args(argc, argv) {
+            Ok(args) => args,
+            Err(e) => {
+                Pam { handle: pamh, debug: true }.log(LOG_ERR, &e);
+                return PAM_IGNORE;
+            }
+        };
+        let pam = Pam { handle: pamh, debug: args.debug };
+        let result = pam.user().and_then(|user| {
+            if !tpm::valid_user(&user) {
+                return Err(format!("refusing unusual user name {user:?}"));
+            }
+            change_password(&pam, &user)
+        });
+        result.unwrap_or_else(|e| {
             pam.log(LOG_ERR, &e);
             PAM_IGNORE
         })

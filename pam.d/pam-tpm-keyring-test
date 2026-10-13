@@ -1,13 +1,12 @@
 #%PAM-1.0
-# Test service: same branches as pam.d/sddm, but instead of unlocking the
-# keyring it checks the resulting PAM_AUTHTOK against the real password.
+# Test service: same branches as pam.d/sddm, without unlocking the keyring.
 # Run as root: pamtester pam-tpm-keyring-test <user> authenticate
-# Type the password to seal it, or press Enter to scan a fingerprint.
+# Type the password, or press Enter to scan a fingerprint; the debug lines in
+# the journal say where the keyring key came from.
 
 auth        [success=2 ignore=ignore default=die]  pam_tpm_keyring.so  fingerprint debug
 auth        requisite   pam_unix.so             use_first_pass
 auth        optional    pam_tpm_keyring.so      seal debug
-# Fails unless PAM_AUTHTOK now holds the correct password.
-auth        required    pam_unix.so             use_first_pass
+auth        required    pam_permit.so
 
 account     required    pam_permit.so

@@ -2,15 +2,22 @@
 name = "pam_tpm_keyring"
 version = "0.1.0"
 edition = "2024"
-description = "PAM module for fingerprint login that also unlocks the GNOME keyring, using a TPM-sealed copy of the password"
+description = "PAM module for fingerprint login that also unlocks the GNOME keyring, using a TPM-sealed keyring key"
 license = "MIT"
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "pam-tpm-keyring"
+path = "src/main.rs"
 
 [profile.release]
 lto = true
 strip = true
 
 [dependencies]
+argon2 = { version = "0.6.0", default-features = false, features = ["alloc", "zeroize"] }
+chacha20poly1305 = { version = "0.11.0", default-features = false, features = ["alloc", "zeroize"] }
 dbus = "0.9"
+libc = "0.2.190"

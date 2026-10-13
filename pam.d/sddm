@@ -10,11 +10,11 @@ auth        required    pam_shells.so
 auth        requisite   pam_nologin.so
 auth        required    pam_faillock.so         preauth
 # Empty password: fingerprint. On a match, skip to pam_env with the unsealed
-# password in PAM_AUTHTOK. Typed password: PAM_IGNORE, fall through.
+# keyring key in PAM_AUTHTOK. Typed password: PAM_IGNORE, fall through.
 auth        [success=3 ignore=ignore default=die]  pam_tpm_keyring.so  fingerprint
 auth        [success=1 default=ignore]  pam_unix.so     use_first_pass
 auth        [default=die]               pam_faillock.so authfail
-# Password path: keep the TPM-sealed copy current.
+# Password path: swap the password for the keyring key, keep the TPM copy current.
 auth        optional    pam_tpm_keyring.so      seal
 auth        required    pam_env.so
 auth        required    pam_faillock.so         authsucc
@@ -24,7 +24,9 @@ auth        required    pam_faillock.so         authsucc
 account     include     system-login
 
 password    include     system-login
--password   optional    pam_gnome_keyring.so    use_authtok
+# The keyring's password is the keyring key, so pam_gnome_keyring can't follow
+# a password change; this rewraps the key instead.
+password    optional    pam_tpm_keyring.so
 
 session     optional    pam_keyinit.so          force revoke
 session     include     system-login
