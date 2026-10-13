@@ -115,8 +115,23 @@ control socket (the one `pam_gnome_keyring` uses). Running it again generates
 a new key.
 
 **After setup, the keyring's own unlock prompt wants the key,** which nobody
-knows. Logins through SDDM unlock it. If it ends up locked in a session
-started some other way, run `sudo pam-tpm-keyring unlock`.
+knows. Logins through SDDM unlock it, and it stays unlocked for the session.
+If it ends up locked anyway (a session started some other way, a daemon
+restart), unlock it with `sudo pam-tpm-keyring unlock`, or graphically:
+
+```sh
+sudo install -m644 polkit/io.github.lucfauvel.pam-tpm-keyring.policy /usr/share/polkit-1/actions/
+sudo install -m755 contrib/unlock-keyring /usr/local/bin/unlock-keyring
+install -Dm644 contrib/unlock-keyring.desktop ~/.local/share/applications/unlock-keyring.desktop
+```
+
+`unlock-keyring` (or "Unlock Keyring" in an app launcher; bind it to a key if
+you like) runs `pkexec pam-tpm-keyring unlock`. Your polkit agent asks for
+your own password, then the keyring is unlocked with the TPM copy of the key,
+the same way a fingerprint login does it. The policy covers only that
+command, asks every time, and only works in an active local session. If the
+TPM copy can't be unsealed, use the `sudo` form, which works from the
+password slot.
 
 **Password changes:** `pam.d/passwd` and `pam.d/sddm` rewrap the key with the
 new password. A change through any other PAM service is caught at the next

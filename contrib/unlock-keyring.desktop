@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Unlock Keyring
+Comment=Unlock the GNOME login keyring with the TPM-sealed key
+Icon=dialog-password
+Exec=/usr/local/bin/unlock-keyring
+Terminal=false
+Categories=Utility;Security;

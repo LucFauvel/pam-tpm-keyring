@@ -6,6 +6,9 @@
 //! - `unlock [USER]`: unlock USER's login keyring with the key, after asking
 //!   for the login password. For sessions not started through SDDM: the
 //!   keyring's own prompt would want the key, which nobody knows.
+//!   Through pkexec (`pkexec pam-tpm-keyring unlock`), polkit has already
+//!   asked for the password: it unlocks the calling user's keyring with the
+//!   TPM copy of the key, like a fingerprint login.
 
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
@@ -90,7 +93,24 @@ fn user_and_password(user: Option<&str>) -> Result<(String, Ids, Secret), String
     Ok((user, ids, password))
 }
 
+/// The user who ran pkexec, if this is running under it. pkexec sets
+/// PKEXEC_UID after polkit authorized the call; only root can fake it, and
+/// root needs no faking.
+fn pkexec_user() -> Result<Option<String>, String> {
+    let Ok(uid) = std::env::var("PKEXEC_UID") else {
+        return Ok(None);
+    };
+    let uid = uid.parse().map_err(|_| format!("bad PKEXEC_UID {uid:?}"))?;
+    account::name_of(uid).map(Some)
+}
+
 fn unlock(user: Option<&str>) -> Result<(), String> {
+    if let Some(caller) = pkexec_user()? {
+        if user.is_some_and(|user| user != caller) {
+            return Err("through pkexec, only your own keyring can be unlocked".into());
+        }
+        return unlock_with_tpm(&caller);
+    }
     let (user, ids, password) = user_and_password(user)?;
     let key = match slot::open(&user, &password) {
         Ok(key) => key,
@@ -101,7 +121,30 @@ fn unlock(user: Option<&str>) -> Result<(), String> {
     Ok(())
 }
 
+/// polkit authenticated the user; the TPM copy needs no password.
+fn unlock_with_tpm(user: &str) -> Result<(), String> {
+    if unsafe { libc::geteuid() } != 0 {
+        return Err("not running as root".into());
+    }
+    if !tpm::valid_user(user) {
+        return Err(format!("refusing unusual user name {user:?}"));
+    }
+    if !slot::exists(user) {
+        return Err(format!("keyring unlock isn't set up for {user}"));
+    }
+    let ids = account::lookup(user)?;
+    let key = tpm::unseal(user).map_err(|e| {
+        format!("the TPM copy of the key can't be unsealed ({e}); run `sudo pam-tpm-keyring unlock`, or log in with your password")
+    })?;
+    control::unlock(&ids, &key)?;
+    println!("Unlocked {user}'s login keyring.");
+    Ok(())
+}
+
 fn setup(user: Option<&str>) -> Result<(), String> {
+    if std::env::var_os("PKEXEC_UID").is_some() {
+        return Err("run setup with sudo, not pkexec".into());
+    }
     if !tpm::secure_boot_enforced() {
         return Err("Secure Boot isn't enforced, so the key can't be sealed to the TPM".into());
     }

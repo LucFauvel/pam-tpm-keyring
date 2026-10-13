@@ -36,6 +36,20 @@ pub struct Ids {
     pub gid: libc::gid_t,
 }
 
+/// The name of the user with `uid`.
+pub fn name_of(uid: libc::uid_t) -> Result<String, String> {
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut buf = vec![0 as libc::c_char; 16384];
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    let ret = unsafe { libc::getpwuid_r(uid, &mut pwd, buf.as_mut_ptr(), buf.len(), &mut result) };
+    if ret != 0 || result.is_null() {
+        return Err(format!("no user with uid {uid}"));
+    }
+    // pw_name points into `buf`, which is still alive here.
+    let name = unsafe { std::ffi::CStr::from_ptr(pwd.pw_name) };
+    name.to_str().map(str::to_owned).map_err(|_| "user name is not valid UTF-8".into())
+}
+
 pub fn lookup(user: &str) -> Result<Ids, String> {
     let name = CString::new(user).map_err(|_| "bad user name".to_string())?;
     let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };

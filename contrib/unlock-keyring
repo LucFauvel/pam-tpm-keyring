@@ -1,0 +1,8 @@
+#!/bin/sh
+# Unlock the login keyring through polkit and say how it went.
+out=$(pkexec /usr/local/bin/pam-tpm-keyring unlock 2>&1)
+case $? in
+    0) notify-send -i dialog-password "Keyring unlocked" "$out" ;;
+    126) exit 1 ;; # the password dialog was dismissed
+    *) notify-send -u critical -i dialog-error "Keyring not unlocked" "$out"; exit 1 ;;
+esac
